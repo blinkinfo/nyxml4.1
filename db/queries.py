@@ -654,3 +654,34 @@ async def get_recent_demo_trades(n: int = 10) -> list:
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+
+async def get_n2_demo_trade_side(current_slot_ts: int) -> str | None:
+    """Return the demo trade side taken at slot N-2, or None if no demo trade exists.
+
+    Mirrors get_n2_trade_side() but looks at is_demo = 1 rows only.
+    Used by TradeManager when demo_trade_enabled is True so the N-2
+    diff filter compares against the demo trade history, not real trades.
+
+    Returns 'Up', 'Down', or None (no demo trade / slot was skipped).
+    """
+    from polymarket.markets import SLOT_DURATION
+    n2_ts = current_slot_ts - (2 * SLOT_DURATION)
+    async with aiosqlite.connect(_db()) as db:
+        db.row_factory = aiosqlite.Row
+        # Find the signal for slot N-2
+        cursor = await db.execute(
+            "SELECT id FROM signals WHERE slot_timestamp = ? AND skipped = 0 AND filter_blocked = 0 LIMIT 1",
+            (n2_ts,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        signal_id = row["id"]
+        # Find a filled demo trade for that signal
+        cursor2 = await db.execute(
+            "SELECT side FROM trades WHERE signal_id = ? AND status = 'filled' AND is_demo = 1 LIMIT 1",
+            (signal_id,),
+        )
+        trade_row = await cursor2.fetchone()
+        return trade_row["side"] if trade_row else None

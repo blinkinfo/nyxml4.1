@@ -333,9 +333,12 @@ async def _check_and_trade() -> None:
     )
 
     # 3. Run Trade Manager filters (N-2 diff filter etc.)
+    # Fetch demo flag here so TradeManager uses the correct N-2 history
+    demo_trade_enabled = await queries.is_demo_trade_enabled()
     filter_result = await TradeManager.check(
         signal_side=side,
         current_slot_ts=slot_ts,
+        is_demo=demo_trade_enabled,
     )
 
     if not filter_result.allowed:
@@ -354,7 +357,7 @@ async def _check_and_trade() -> None:
     # 4. Check autotrade
     autotrade = await queries.is_autotrade_enabled()
     trade_amount = await queries.get_trade_amount()
-    demo_trade_enabled = await queries.is_demo_trade_enabled()
+    # demo_trade_enabled already fetched above (step 3)
 
     # 5. Send signal notification (with ADX and N-2 filter info)
     msg = format_signal(

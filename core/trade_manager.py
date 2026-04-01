@@ -6,6 +6,8 @@ Currently implements the 'Diff Side from N-2' filter:
   - If N-2 had no trade (skipped, filtered, or bot was offline), the
     filter passes (we allow the trade — no data = no block).
   - Toggle stored in DB settings key 'n2_filter_enabled' (default: true).
+  - When is_demo=True the filter checks demo trade history (is_demo=1)
+    instead of real trade history (is_demo=0).
 
 Calling convention:
     result = await TradeManager.check(signal_side, current_slot_ts)
@@ -37,13 +39,21 @@ class TradeManager:
     """Stateless pre-trade gate.  All methods are async class methods."""
 
     @classmethod
-    async def check(cls, signal_side: str, current_slot_ts: int) -> FilterResult:
+    async def check(
+        cls,
+        signal_side: str,
+        current_slot_ts: int,
+        is_demo: bool = False,
+    ) -> FilterResult:
         """Run all active filters. Returns FilterResult(allowed=True/False).
+
+        Pass is_demo=True when the scheduler is running the demo trade path
+        so the N-2 lookup queries demo trades rather than real trades.
 
         Filters run in order. First block wins.
         """
         # --- Filter 1: Diff Side from N-2 ---
-        n2_result = await cls._check_n2_filter(signal_side, current_slot_ts)
+        n2_result = await cls._check_n2_filter(signal_side, current_slot_ts, is_demo=is_demo)
         if not n2_result.allowed:
             return n2_result
 
@@ -55,11 +65,20 @@ class TradeManager:
     # ------------------------------------------------------------------
 
     @classmethod
-    async def _check_n2_filter(cls, signal_side: str, current_slot_ts: int) -> FilterResult:
+    async def _check_n2_filter(
+        cls,
+        signal_side: str,
+        current_slot_ts: int,
+        is_demo: bool = False,
+    ) -> FilterResult:
         """Diff Side from N-2 filter.
 
         Block if: filter enabled AND N-2 trade side == current signal side.
         Pass if:  filter disabled OR N-2 had no trade OR sides differ.
+
+        When is_demo=True, looks up the N-2 side from demo trades only
+        (is_demo=1).  When is_demo=False (default), looks up real trades
+        (is_demo=0).
         """
         enabled = await queries.is_n2_filter_enabled()
         if not enabled:
@@ -69,12 +88,16 @@ class TradeManager:
                 filter_name="n2_diff",
             )
 
-        n2_side = await queries.get_n2_trade_side(current_slot_ts)
+        if is_demo:
+            n2_side = await queries.get_n2_demo_trade_side(current_slot_ts)
+        else:
+            n2_side = await queries.get_n2_trade_side(current_slot_ts)
 
         if n2_side is None:
             # No N-2 trade data — allow (bot was offline, slot was skipped, etc.)
             log.debug(
-                "N-2 filter: no trade found for N-2 slot (ts=%d) — allowing %s",
+                "N-2 filter: no %strade found for N-2 slot (ts=%d) — allowing %s",
+                "demo " if is_demo else "",
                 current_slot_ts - 600,  # approximate, real value computed in query
                 signal_side,
             )
@@ -87,9 +110,10 @@ class TradeManager:
 
         if n2_side == signal_side:
             log.info(
-                "N-2 filter BLOCKED: current=%s matches N-2=%s — skipping trade",
+                "N-2 filter BLOCKED: current=%s matches N-2=%s (demo=%s) — skipping trade",
                 signal_side,
                 n2_side,
+                is_demo,
             )
             return FilterResult(
                 allowed=False,
@@ -99,9 +123,10 @@ class TradeManager:
             )
 
         log.info(
-            "N-2 filter PASSED: current=%s differs from N-2=%s — allowing trade",
+            "N-2 filter PASSED: current=%s differs from N-2=%s (demo=%s) — allowing trade",
             signal_side,
             n2_side,
+            is_demo,
         )
         return FilterResult(
             allowed=True,
