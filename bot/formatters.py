@@ -68,24 +68,34 @@ def format_filter_blocked(
     slot_end_str: str,
     reason: str,
     n2_side: str | None = None,
+    n4_win: bool | None = None,
     is_demo: bool = False,
 ) -> str:
-    """Sent when the N-2 filter blocks a real trade or demo trade."""
+    """Sent when the N-2/N-4 filter blocks a real trade or demo trade."""
     side_emoji = "\U0001f4c8" if side == "Up" else "\U0001f4c9"
     prefix = "\U0001f9ea [DEMO] " if is_demo else ""
     n2_line = ""
     if n2_side:
         n2_emoji = "\U0001f4c8" if n2_side == "Up" else "\U0001f4c9"
         n2_line = f"\u2502 {n2_emoji} N-2 Side: {n2_side}\n"
+    n4_line = ""
+    if n4_win is True:
+        n4_line = "\u2502 \u2705 N-4 Result: Win\n"
+    elif n4_win is False:
+        n4_line = "\u2502 \u274c N-4 Result: Loss\n"
+    else:
+        n4_line = "\u2502 \u2753 N-4 Result: No data\n"
     return (
-        f"\U0001f6ab <b>{prefix}Trade Blocked \u2014 N-2 Filter</b>\n"
+        f"\U0001f6ab <b>{prefix}Trade Blocked \u2014 Filter</b>\n"
         "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"\u2502 \u23f0 Slot: {slot_start_str}-{slot_end_str} UTC\n"
         f"\u2502 {side_emoji} Signal: {side}\n"
         f"{n2_line}"
+        f"{n4_line}"
         f"\u2502 \U0001f6ab Reason: {reason}\n"
         "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
     )
+
 
 
 def format_signal_resolution(

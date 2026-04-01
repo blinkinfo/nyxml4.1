@@ -412,6 +412,7 @@ async def _check_and_trade() -> None:
             slot_end_str=slot_end_str,
             reason=filter_result.reason,
             n2_side=filter_result.n2_side,
+            n4_win=filter_result.n4_win,
             is_demo=demo_trade_enabled,
         )
         await _send_telegram(msg)
