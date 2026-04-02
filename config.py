@@ -51,15 +51,13 @@ DB_PATH: str = os.getenv("DB_PATH", "autopoly.db")
 # ---------------------------------------------------------------------------
 # Strategy
 # ---------------------------------------------------------------------------
-SIGNAL_THRESHOLD: float = 0.51
-SIGNAL_LEAD_TIME: int = 85  # seconds before slot end to check signal
+STRATEGY_NAME: str = os.getenv("STRATEGY_NAME", "pattern")  # active strategy
+COINBASE_CANDLE_URL: str = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
 
 # ---------------------------------------------------------------------------
-# ADX Filter
+# Signal Timing
 # ---------------------------------------------------------------------------
-ADX_LENGTH: int = 14                # ADX period (Wilder's smoothing)
-ADX_CANDLE_COUNT: int = 300         # 5-min candles to fetch from Coinbase (max Coinbase allows; needed for ADX warm-up)
-COINBASE_CANDLE_URL: str = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+SIGNAL_LEAD_TIME: int = 85  # seconds before slot end to check signal
 
 # ---------------------------------------------------------------------------
 # Auto-Redeem

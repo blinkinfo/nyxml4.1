@@ -51,12 +51,6 @@ async def is_auto_redeem_enabled() -> bool:
     return val == "true"
 
 
-async def is_n2_filter_enabled() -> bool:
-    """Return True if the Diff-from-N2 trade filter is enabled (default: True)."""
-    val = await get_setting("n2_filter_enabled")
-    # Default to True if not set (safe fallback)
-    return val != "false"
-
 
 async def get_n2_trade_side(current_slot_ts: int) -> str | None:
     """

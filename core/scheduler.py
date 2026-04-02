@@ -330,18 +330,14 @@ async def _check_and_trade() -> None:
     from bot.formatters import (
         format_signal,
         format_skip,
-        format_filter_blocked,
         format_trade_filled,
         format_trade_unmatched,
         format_trade_aborted,
         format_trade_retrying,
-        format_signal_resolution,
-        format_trade_resolution,
-        format_demo_resolution,
     )
     from core.trade_manager import TradeManager
 
-    # 1. Check signal
+    # 1. Check signal (delegated to active strategy via orchestrator)
     signal = await strategy.check_signal()
     if signal is None:
         log.error("Strategy returned None (hard error) — skipping this slot")
@@ -366,8 +362,12 @@ async def _check_and_trade() -> None:
             opposite_price=None,
             skipped=True,
         )
-        msg = format_skip(slot_start_str=slot_start_str, slot_end_str=slot_end_str,
-                          up_price=signal["up_price"], down_price=signal["down_price"])
+        msg = format_skip(
+            slot_start_str=slot_start_str,
+            slot_end_str=slot_end_str,
+            reason=signal.get("reason", "No pattern match"),
+            pattern=signal.get("pattern"),
+        )
         await _send_telegram(msg)
         _schedule_next()
         return
@@ -376,12 +376,8 @@ async def _check_and_trade() -> None:
     entry_price = signal["entry_price"]
     opposite_price = signal["opposite_price"]
     token_id = signal["token_id"]
+    pattern = signal.get("pattern")
     slug = signal.get("slot_n1_slug", f"btc-updown-5m-{slot_ts}")
-
-    # ADX fields from strategy
-    adx_direction = signal.get("adx_direction")
-    adx_flipped = signal.get("adx_flipped", False)
-    adx_value = signal.get("adx_value")
 
     signal_id = await queries.insert_signal(
         slot_start=slot_start_full,
@@ -393,44 +389,26 @@ async def _check_and_trade() -> None:
         skipped=False,
     )
 
-    # 3. Run Trade Manager filters (N-2 diff filter etc.)
-    # Fetch demo flag here so TradeManager uses the correct N-2 history
+    # 3. TradeManager passthrough (filters removed — always allowed)
     demo_trade_enabled = await queries.is_demo_trade_enabled()
     filter_result = await TradeManager.check(
         signal_side=side,
         current_slot_ts=slot_ts,
         is_demo=demo_trade_enabled,
     )
-
-    if not filter_result.allowed:
-        # Mark signal as filter-blocked in DB — trade will be skipped,
-        # but we do NOT return here so resolution still happens (step 7).
-        await queries.update_signal_filter_blocked(signal_id)
-        msg = format_filter_blocked(
-            side=side,
-            slot_start_str=slot_start_str,
-            slot_end_str=slot_end_str,
-            reason=filter_result.reason,
-            n2_side=filter_result.n2_side,
-            n4_win=filter_result.n4_win,
-            is_demo=demo_trade_enabled,
-        )
-        await _send_telegram(msg)
+    # filter_result.allowed is always True — but keeping the check for future extensibility
 
     # 4. Check autotrade
     autotrade = await queries.is_autotrade_enabled()
     trade_amount = await queries.get_trade_amount()
-    # demo_trade_enabled already fetched above (step 3)
 
-    # 5. Send signal notification — pure market signal, no trade-layer details
+    # 5. Send signal notification
     msg = format_signal(
         side=side,
         entry_price=entry_price,
         slot_start_str=slot_start_str,
         slot_end_str=slot_end_str,
-        adx_direction=adx_direction,
-        adx_flipped=adx_flipped,
-        adx_value=adx_value,
+        pattern=pattern,
     )
     await _send_telegram(msg)
 
@@ -439,13 +417,8 @@ async def _check_and_trade() -> None:
     amount_usdc: float | None = None
     slot_label = f"{slot_start_str}-{slot_end_str}"
 
-    if not filter_result.allowed:
-        # Filter blocked — no trade placed, trade_id stays None
-        pass
-    elif demo_trade_enabled:
-        # ── Demo Trade Path ─────────────────────────────────────────────────
-        # Simulate trade immediately without touching Polymarket.
-        # Deduct from demo bankroll at entry; credit back at resolution.
+    if demo_trade_enabled:
+        # -- Demo Trade Path --
         amount_usdc = round(trade_amount, 2)
         demo_bankroll = await queries.get_demo_bankroll()
 
@@ -461,7 +434,6 @@ async def _check_and_trade() -> None:
             )
             await _send_telegram(msg)
         else:
-            # Deduct trade amount from bankroll
             new_bankroll = await queries.adjust_demo_bankroll(-amount_usdc)
 
             trade_id = await queries.insert_trade(

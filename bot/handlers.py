@@ -120,7 +120,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     autotrade = await queries.is_autotrade_enabled()
     auto_redeem = await queries.is_auto_redeem_enabled()
-    n2_filter = await queries.is_n2_filter_enabled()
     trade_amount = await queries.get_trade_amount()
     last_sig = await queries.get_last_signal()
     last_sig_str = None
@@ -139,7 +138,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         uptime_str=_uptime(),
         last_signal=last_sig_str,
         auto_redeem=auto_redeem,
-        n2_filter_enabled=n2_filter,
         demo_trade_enabled=demo_trade,
         demo_bankroll=demo_bankroll,
     )
@@ -207,12 +205,11 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     autotrade = await queries.is_autotrade_enabled()
     auto_redeem = await queries.is_auto_redeem_enabled()
-    n2_filter = await queries.is_n2_filter_enabled()
     trade_amount = await queries.get_trade_amount()
     demo_trade = await queries.is_demo_trade_enabled()
     demo_bankroll = await queries.get_demo_bankroll()
     text = "\u2699\ufe0f <b>Settings</b>\n\nTap a button to change:"
-    kb = settings_keyboard(autotrade, trade_amount, auto_redeem, n2_filter, demo_trade, demo_bankroll)
+    kb = settings_keyboard(autotrade, trade_amount, auto_redeem, demo_trade, demo_bankroll)
     if update.callback_query:
         await update.callback_query.answer()
         await _safe_edit(update.callback_query, text, reply_markup=kb)
@@ -400,13 +397,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await queries.set_setting("autotrade_enabled", "false" if current else "true")
         await cmd_settings(update, context)
 
-    elif data == "toggle_n2_filter":
-        current = await queries.is_n2_filter_enabled()
-        await queries.set_setting("n2_filter_enabled", "false" if current else "true")
-        new_state = "OFF" if current else "ON"
-        await query.answer(f"N-2 Filter {new_state}")
-        await cmd_settings(update, context)
-
     elif data == "toggle_auto_redeem":
         current = await queries.is_auto_redeem_enabled()
         await queries.set_setting("auto_redeem_enabled", "false" if current else "true")
@@ -546,7 +536,7 @@ async def _handle_redeem_confirm(update: Update, context: ContextTypes.DEFAULT_T
 
 @auth_check
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ── Demo bankroll input ──────────────────────────────────────────────
+    # -- Demo bankroll input -------------------------------------------------------
     if context.user_data.get("awaiting_demo_bankroll"):
         context.user_data["awaiting_demo_bankroll"] = False
         raw = update.message.text.strip().replace("$", "")
@@ -568,9 +558,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # Refresh settings panel
         autotrade = await queries.is_autotrade_enabled()
         auto_redeem = await queries.is_auto_redeem_enabled()
-        n2_filter = await queries.is_n2_filter_enabled()
         demo_trade = await queries.is_demo_trade_enabled()
-        kb = settings_keyboard(autotrade, await queries.get_trade_amount(), auto_redeem, n2_filter, demo_trade, amount)
+        kb = settings_keyboard(autotrade, await queries.get_trade_amount(), auto_redeem, demo_trade, amount)
         await update.message.reply_text(
             "\u2699\ufe0f <b>Settings</b>",
             reply_markup=kb,
@@ -578,7 +567,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    # ── Trade amount input ───────────────────────────────────────────────
+    # -- Trade amount input --------------------------------------------------------
     if not context.user_data.get("awaiting_amount"):
         return
 
@@ -603,16 +592,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Show settings panel again
     autotrade = await queries.is_autotrade_enabled()
     auto_redeem = await queries.is_auto_redeem_enabled()
-    n2_filter = await queries.is_n2_filter_enabled()
     demo_trade = await queries.is_demo_trade_enabled()
     demo_bankroll = await queries.get_demo_bankroll()
-    kb = settings_keyboard(autotrade, amount, auto_redeem, n2_filter, demo_trade, demo_bankroll)
+    kb = settings_keyboard(autotrade, amount, auto_redeem, demo_trade, demo_bankroll)
     await update.message.reply_text(
         "\u2699\ufe0f <b>Settings</b>",
         reply_markup=kb,
         parse_mode="HTML",
     )
-
 
 
 # ---------------------------------------------------------------------------

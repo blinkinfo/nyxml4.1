@@ -67,7 +67,6 @@ DEFAULT_SETTINGS = {
     "autotrade_enabled": "false",
     "trade_amount_usdc": str(cfg.TRADE_AMOUNT_USDC),
     "auto_redeem_enabled": "false",
-    "n2_filter_enabled": "true",
     "demo_trade_enabled": "false",
     "demo_bankroll_usdc": "1000.00",
 }

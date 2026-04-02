@@ -14,18 +14,14 @@ def format_signal(
     entry_price: float,
     slot_start_str: str,
     slot_end_str: str,
-    adx_direction: str | None = None,
-    adx_flipped: bool = False,
-    adx_value: float | None = None,
+    pattern: str | None = None,
 ) -> str:
     """Pure signal notification — market info only, no trade layer details."""
     side_emoji = "\U0001f4c8" if side == "Up" else "\U0001f4c9"
 
-    adx_line = ""
-    if adx_direction is not None and adx_value is not None:
-        adx_emoji = "\U0001f4c8" if adx_direction == "rising" else "\U0001f4c9"
-        flip_note = " (FLIPPED)" if adx_flipped else ""
-        adx_line = f"\u2502 {adx_emoji} ADX(14): {adx_value:.2f} {adx_direction}{flip_note}\n"
+    pattern_line = ""
+    if pattern:
+        pattern_line = f"\u2502 \U0001f522 Pattern: {pattern}\n"
 
     return (
         "\U0001f4e1 <b>Signal Fired!</b>\n"
@@ -33,7 +29,7 @@ def format_signal(
         f"\u2502 \u23f0 Slot: {slot_start_str}-{slot_end_str} UTC\n"
         f"\u2502 {side_emoji} Side: {side}\n"
         f"\u2502 \U0001f4b2 Ask Price: ${entry_price:.2f}\n"
-        f"{adx_line}"
+        f"{pattern_line}"
         "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
     )
 
@@ -41,61 +37,18 @@ def format_signal(
 def format_skip(
     slot_start_str: str,
     slot_end_str: str,
-    up_price: float,
-    down_price: float,
-    adx_direction: str | None = None,
-    adx_value: float | None = None,
+    reason: str = "No pattern match",
+    pattern: str | None = None,
 ) -> str:
-    adx_line = ""
-    if adx_direction is not None and adx_value is not None:
-        adx_emoji = "\U0001f4c8" if adx_direction == "rising" else "\U0001f4c9"
-        adx_line = f"\u2502 {adx_emoji} ADX(14): {adx_value:.2f} {adx_direction}\n"
-
+    """Skip notification when the strategy does not generate a trade signal."""
+    pattern_line = f" | Pattern: {pattern}" if pattern else ""
     return (
         "\u23ed\ufe0f <b>No Signal</b>\n"
         "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"\u2502 \u23f0 Slot: {slot_start_str}-{slot_end_str} UTC\n"
-        f"\u2502 \U0001f4c8 Up Ask: ${up_price:.2f}  |  \U0001f4c9 Down Ask: ${down_price:.2f}\n"
-        f"{adx_line}"
-        "\u2502 Neither side \u2265 $0.51 \u2014 skipping\n"
+        f"\u2502 {reason}{pattern_line}\n"
         "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
     )
-
-
-def format_filter_blocked(
-    side: str,
-    slot_start_str: str,
-    slot_end_str: str,
-    reason: str,
-    n2_side: str | None = None,
-    n4_win: bool | None = None,
-    is_demo: bool = False,
-) -> str:
-    """Sent when the N-2 diff filter or N-4 win filter blocks a real or demo trade."""
-    side_emoji = "\U0001f4c8" if side == "Up" else "\U0001f4c9"
-    prefix = "\U0001f9ea [DEMO] " if is_demo else ""
-    n2_line = ""
-    if n2_side:
-        n2_emoji = "\U0001f4c8" if n2_side == "Up" else "\U0001f4c9"
-        n2_line = f"\u2502 {n2_emoji} N-2 Side: {n2_side}\n"
-    n4_line = ""
-    if n4_win is not None:
-        n4_emoji = "\u2705" if n4_win else "\u274c"
-        n4_label = "Win" if n4_win else "Loss"
-        n4_line = f"\u2502 {n4_emoji} N-4 Result: {n4_label}\n"
-    elif n4_win is None and "N-4" in reason:
-        n4_line = "\u2502 \u2753 N-4 Result: No data\n"
-    return (
-        f"{prefix}\U0001f6ab <b>Trade Blocked by Filter</b>\n"
-        "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"\u2502 \u23f0 Slot: {slot_start_str}-{slot_end_str} UTC\n"
-        f"\u2502 {side_emoji} Signal: {side}\n"
-        f"{n2_line}"
-        f"{n4_line}"
-        f"\u2502 \u26d4 Reason: {reason}\n"
-        "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
-    )
-
 
 
 def format_signal_resolution(
@@ -413,7 +366,7 @@ def format_signal_stats(stats: dict[str, Any], label: str = "All Time") -> str:
     lines = [
         f"\U0001f4ca <b>Signal Performance ({label})</b>",
         SEP,
-        f"\U0001f4e1 Total Signals: {stats['total_signals']}",
+        f"\u26a1 Total Signals: {stats['total_signals']}",
         f"\u2705 Wins: {stats['wins']}  |  \u274c Losses: {stats['losses']}",
         f"\U0001f4c8 Win Rate: {stats['win_pct']}%",
         SEP,
@@ -462,7 +415,6 @@ def format_status(
     uptime_str: str,
     last_signal: str | None,
     auto_redeem: bool = False,
-    n2_filter_enabled: bool = True,
     demo_trade_enabled: bool = False,
     demo_bankroll: float | None = None,
 ) -> str:
@@ -470,7 +422,6 @@ def format_status(
     conn_text = "Connected" if connected else "Disconnected"
     at_text = "ON" if autotrade else "OFF"
     ar_text = "ON" if auto_redeem else "OFF"
-    n2_text = "ON" if n2_filter_enabled else "OFF"
     dt_text = "ON" if demo_trade_enabled else "OFF"
     bal_text = f"{balance:.2f} USDC" if balance is not None else "N/A"
     sig_text = last_signal or "None"
@@ -484,7 +435,6 @@ def format_status(
         f"\U0001f4b0 Balance: {bal_text}",
         SEP,
         f"\U0001f916 AutoTrade: {at_text}",
-        f"\U0001f9ea N-2 Filter: {n2_text}",
         f"\U0001f4b5 Trade Amount: ${trade_amount:.2f}",
         f"\U0001f4ca Open Positions: {open_positions}",
         f"\U0001f4b0 Auto-Redeem: {ar_text}",
@@ -545,19 +495,11 @@ def format_help() -> str:
         "/demo \u2014 Demo trading mode & virtual bankroll\n"
         "/help \u2014 This help message\n\n"
         "<b>How it works:</b>\n"
-        "Every 5 minutes the bot checks the NEXT slot's BTC up/down "
-        "prices 85 seconds before the current slot ends. If either "
-        "side \u2265 $0.51, a signal fires and trades that slot.\n\n"
-        "<b>ADX Filter:</b>\n"
-        "The bot computes ADX(14) from Coinbase BTC-USD 5-minute candles. "
-        "If ADX is <b>rising</b> (strengthening trend), the signal is "
-        "<b>flipped</b> (Up\u2194Down) to fade the consensus. If ADX is "
-        "falling or flat, the original signal is kept. "
-        "With AutoTrade ON, a FOK market order is placed automatically.\n\n"
-        "<b>N-2 Diff Filter:</b>\n"
-        "Trades are only taken when the current signal side DIFFERS from the side "
-        "traded two slots ago (N-2). If N-2 had no trade, the filter passes. "
-        "Toggle via Settings \u2192 N-2 Filter. Default: ON.\n\n"
+        "Every 5 minutes the bot analyses the last six closed BTC-USD "
+        "5-minute candles from Coinbase, builds a 6-character pattern "
+        "(U=up, D=down), and looks it up in a pattern table. If the "
+        "pattern matches, a signal fires for the predicted direction. "
+        "If no match, the slot is skipped.\n\n"
         "<b>Auto-Redeem:</b>\n"
         "When enabled, the bot periodically scans your wallet for resolved "
         "winning positions and calls redeemPositions() on the Polygon CTF "
