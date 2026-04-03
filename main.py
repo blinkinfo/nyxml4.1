@@ -54,12 +54,6 @@ def main() -> None:
     asyncio.run(init_db())
     log.info("Database initialised at %s", cfg.DB_PATH)
 
-    # One-time cleanup: remove bad redemption records from sig-type-2 bug
-    _deleted = asyncio.run(cleanup_bad_redemptions())
-    if _deleted:
-        log.info("Startup cleanup: deleted %d bad redemption record(s)", _deleted)
-    else:
-        log.debug("Startup cleanup: no bad redemption records found (already clean)")
 
     # 2. Init Polymarket client (synchronous — derives creds)
     poly_client: PolymarketClient | None = None
