@@ -104,8 +104,9 @@ async def fetch_positions(wallet_address: str) -> list[dict[str, Any]]:
     Raises RuntimeError on network failure or unexpected response shape.
 
     Each dict typically contains:
-      asset, conditionId, outcomeIndex, size, currentValue,
-      market { question, resolved, outcomes, outcomePrices, conditionId }
+      proxyWallet, asset, conditionId, size, curPrice, redeemable,
+      outcomeIndex, outcome, title, slug, currentValue, initialValue, mergeable,
+      negativeRisk, endDate (flat structure -- no nested market object)
     """
     params = {"user": wallet_address, "sizeThreshold": "0.01"}
     try:
@@ -138,65 +139,43 @@ def find_redeemable_positions(positions: list[dict[str, Any]]) -> list[dict[str,
     """Filter *positions* to those that can be redeemed right now.
 
     A position is redeemable when ALL of the following hold:
-      1. size > 0  (we actually hold tokens)
-      2. The market is resolved (payout denominator != 0, i.e. outcomePrices
-         contains a 1.0 for some outcome)
-      3. Our outcome is the WINNER (outcomeIndex matches the outcome priced at 1.0)
+      1. size > 0.001  (we hold tokens)
+      2. redeemable == True  (market is resolved, API already computed this)
+      3. curPrice >= 0.99  (our outcome won — skip losing positions)
 
-    Returns a list of dicts enriched with:
-      ``condition_id``  (bytes32 hex string)
-      ``outcome_index`` (int, 0-based)
-      ``size``          (float)
-      ``title``         (str, market question)
+    API schema (flat Polymarket Data API /positions response):
+      conditionId, size, curPrice, redeemable, outcomeIndex, outcome, title
+
+    Returns a list of dicts with:
+      condition_id, outcome_index, size, title, raw, cur_price
     """
-    import json as _json
-
     redeemable: list[dict[str, Any]] = []
 
     for pos in positions:
         try:
+            # 1. Must hold tokens
             size = float(pos.get("size", 0) or 0)
             if size < 0.001:
                 continue
 
-            # conditionId can live at top level or inside market sub-dict
-            condition_id: str | None = (
-                pos.get("conditionId")
-                or pos.get("market", {}).get("conditionId")
-            )
+            # 2. Market must be resolved (API pre-computed flag)
+            if not pos.get("redeemable"):
+                continue
+
+            # 3. Our outcome must have won (curPrice >= 0.99)
+            cur_price = float(pos.get("curPrice") or 0)
+            if cur_price < 0.99:
+                continue
+
+            # conditionId — ensure 0x prefix
+            condition_id = pos.get("conditionId", "")
             if not condition_id:
                 continue
+            if not condition_id.startswith("0x"):
+                condition_id = "0x" + condition_id
 
-            # outcomeIndex — which token we hold (0 = Up/Yes, 1 = Down/No, etc.)
-            outcome_index: int | None = pos.get("outcomeIndex")
-            if outcome_index is None:
-                continue
-
-            # outcomePrices — array of resolution prices
-            market = pos.get("market") or pos  # tolerate flat structure
-            prices_raw = market.get("outcomePrices")
-            if not prices_raw:
-                continue
-            if isinstance(prices_raw, str):
-                prices_raw = _json.loads(prices_raw)
-            prices = [float(p) for p in prices_raw]
-
-            # Resolved = any price >= 0.99
-            if not any(p >= 0.99 for p in prices):
-                continue
-
-            # Our outcome must be the winner
-            if outcome_index >= len(prices):
-                continue
-            if prices[outcome_index] < 0.99:
-                continue  # our side lost — nothing to redeem
-
-            title = (
-                market.get("question")
-                or market.get("title")
-                or pos.get("title")
-                or condition_id[:16] + "..."
-            )
+            outcome_index = int(pos["outcomeIndex"])
+            title = pos.get("title", condition_id[:16])
 
             redeemable.append({
                 "condition_id": condition_id,
@@ -204,6 +183,7 @@ def find_redeemable_positions(positions: list[dict[str, Any]]) -> list[dict[str,
                 "size": size,
                 "title": title,
                 "raw": pos,
+                "cur_price": cur_price,
             })
 
         except Exception:
@@ -211,6 +191,7 @@ def find_redeemable_positions(positions: list[dict[str, Any]]) -> list[dict[str,
             continue
 
     return redeemable
+
 
 
 # ---------------------------------------------------------------------------
