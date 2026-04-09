@@ -201,8 +201,11 @@ def main() -> None:
             )
 
         # --- Step 5: Start scheduler — ALWAYS reached regardless of above ---
-        start_scheduler(application, poly_client)
-        log.info("post_init: scheduler started successfully")
+        try:
+            start_scheduler(application, poly_client)
+            log.info("post_init: scheduler started successfully")
+        except Exception:
+            log.exception("post_init: start_scheduler failed — bot will run without scheduler")
 
         # --- Step 6: Recover any unresolved signals from previous run ---
         try:

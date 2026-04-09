@@ -335,131 +335,157 @@ async def _auto_redeem_job() -> None:
 
 
 async def _check_and_trade() -> None:
-    """Core loop body — called at T-85s for each slot."""
-    # --- Hour filter: skip trading during blocked UTC hours ---
-    now_utc = datetime.now(timezone.utc)
-    if now_utc.hour in cfg.BLOCKED_TRADE_HOURS_UTC:
-        log.info(
-            "Hour filter: skipping slot at %s UTC (blocked hours: %s)",
-            now_utc.strftime("%H:%M"),
-            sorted(cfg.BLOCKED_TRADE_HOURS_UTC),
+    """Core loop body — called at T-85s for each slot.
+
+    _schedule_next() is always called in the finally block, so the chain
+    can never break — even if an unhandled exception escapes any inner code.
+    """
+    try:
+        # --- Hour filter ---
+        now_utc = datetime.now(timezone.utc)
+        if now_utc.hour in cfg.BLOCKED_TRADE_HOURS_UTC:
+            log.info(
+                "Hour filter: skipping slot at %s UTC (blocked hours: %s)",
+                now_utc.strftime("%H:%M"),
+                sorted(cfg.BLOCKED_TRADE_HOURS_UTC),
+            )
+            return   # finally will still call _schedule_next()
+
+        from bot.formatters import (
+            format_signal,
+            format_skip,
+            format_trade_filled,
+            format_trade_unmatched,
+            format_trade_aborted,
+            format_trade_retrying,
         )
-        _schedule_next()
-        return
+        from core.trade_manager import TradeManager
 
-    from bot.formatters import (
-        format_signal,
-        format_skip,
-        format_trade_filled,
-        format_trade_unmatched,
-        format_trade_aborted,
-        format_trade_retrying,
-    )
-    from core.trade_manager import TradeManager
+        # 1. Check signal (delegated to active strategy via orchestrator)
+        signal = await strategy.check_signal()
+        if signal is None:
+            log.error("Strategy returned None (hard error) — skipping this slot")
+            await _send_telegram("\u274c Strategy error — could not fetch prices. Skipping slot.")
+            return
 
-    # 1. Check signal (delegated to active strategy via orchestrator)
-    signal = await strategy.check_signal()
-    if signal is None:
-        log.error("Strategy returned None (hard error) — skipping this slot")
-        await _send_telegram("\u274c Strategy error — could not fetch prices. Skipping slot.")
-        _schedule_next()
-        return
+        slot_start_full = signal["slot_n1_start_full"]
+        slot_end_full = signal["slot_n1_end_full"]
+        slot_start_str = signal["slot_n1_start_str"]
+        slot_end_str = signal["slot_n1_end_str"]
+        slot_ts = signal["slot_n1_ts"]
 
-    slot_start_full = signal["slot_n1_start_full"]
-    slot_end_full = signal["slot_n1_end_full"]
-    slot_start_str = signal["slot_n1_start_str"]
-    slot_end_str = signal["slot_n1_end_str"]
-    slot_ts = signal["slot_n1_ts"]
+        # 2. Log signal to DB
+        if signal["skipped"]:
+            signal_id = await queries.insert_signal(
+                slot_start=slot_start_full,
+                slot_end=slot_end_full,
+                slot_timestamp=slot_ts,
+                side=None,
+                entry_price=None,
+                opposite_price=None,
+                skipped=True,
+            )
+            msg = format_skip(
+                slot_start_str=slot_start_str,
+                slot_end_str=slot_end_str,
+                reason=signal.get("reason", "No pattern match"),
+                pattern=signal.get("pattern"),
+            )
+            await _send_telegram(msg)
+            return
 
-    # 2. Log signal to DB
-    if signal["skipped"]:
+        side = signal["side"]
+        entry_price = signal["entry_price"]
+        opposite_price = signal["opposite_price"]
+        token_id = signal["token_id"]
+        pattern = signal.get("pattern")
+        slug = signal.get("slot_n1_slug", f"btc-updown-5m-{slot_ts}")
+
         signal_id = await queries.insert_signal(
             slot_start=slot_start_full,
             slot_end=slot_end_full,
             slot_timestamp=slot_ts,
-            side=None,
-            entry_price=None,
-            opposite_price=None,
-            skipped=True,
+            side=side,
+            entry_price=entry_price,
+            opposite_price=opposite_price,
+            skipped=False,
+            pattern=pattern,
         )
-        msg = format_skip(
+
+        # 3. TradeManager passthrough (filters removed — always allowed)
+        demo_trade_enabled = await queries.is_demo_trade_enabled()
+        filter_result = await TradeManager.check(
+            signal_side=side,
+            current_slot_ts=slot_ts,
+            is_demo=demo_trade_enabled,
+        )
+        # filter_result.allowed is always True — but keeping the check for future extensibility
+
+        # 4. Check autotrade
+        autotrade = await queries.is_autotrade_enabled()
+        trade_amount, _amount_label = await queries.resolve_trade_amount(
+            poly_client=_poly_client,
+            is_demo=demo_trade_enabled,
+        )
+
+        # 5. Send signal notification
+        msg = format_signal(
+            side=side,
+            entry_price=entry_price,
             slot_start_str=slot_start_str,
             slot_end_str=slot_end_str,
-            reason=signal.get("reason", "No pattern match"),
-            pattern=signal.get("pattern"),
+            pattern=pattern,
         )
         await _send_telegram(msg)
-        _schedule_next()
-        return
 
-    side = signal["side"]
-    entry_price = signal["entry_price"]
-    opposite_price = signal["opposite_price"]
-    token_id = signal["token_id"]
-    pattern = signal.get("pattern")
-    slug = signal.get("slot_n1_slug", f"btc-updown-5m-{slot_ts}")
+        # 6. Place trade if autotrade on (with robust retry logic)
+        trade_id: int | None = None
+        amount_usdc: float | None = None
+        slot_label = f"{slot_start_str}-{slot_end_str}"
 
-    signal_id = await queries.insert_signal(
-        slot_start=slot_start_full,
-        slot_end=slot_end_full,
-        slot_timestamp=slot_ts,
-        side=side,
-        entry_price=entry_price,
-        opposite_price=opposite_price,
-        skipped=False,
-        pattern=pattern,
-    )
+        if demo_trade_enabled:
+            # -- Demo Trade Path --
+            amount_usdc = round(trade_amount, 2)
+            demo_bankroll = await queries.get_demo_bankroll()
 
-    # 3. TradeManager passthrough (filters removed — always allowed)
-    demo_trade_enabled = await queries.is_demo_trade_enabled()
-    filter_result = await TradeManager.check(
-        signal_side=side,
-        current_slot_ts=slot_ts,
-        is_demo=demo_trade_enabled,
-    )
-    # filter_result.allowed is always True — but keeping the check for future extensibility
+            if demo_bankroll < amount_usdc:
+                log.warning(
+                    "Demo bankroll ($%.2f) insufficient for trade amount ($%.2f) — skipping demo trade",
+                    demo_bankroll, amount_usdc,
+                )
+                msg = (
+                    f"\U0001f9ea <b>[DEMO] Bankroll Insufficient</b>\n"
+                    f"Bankroll: ${demo_bankroll:.2f}  |  Required: ${amount_usdc:.2f}\n"
+                    f"Demo trade skipped. Top up via /settings."
+                )
+                await _send_telegram(msg)
+            else:
+                new_bankroll = await queries.adjust_demo_bankroll(-amount_usdc)
 
-    # 4. Check autotrade
-    autotrade = await queries.is_autotrade_enabled()
-    trade_amount, _amount_label = await queries.resolve_trade_amount(
-        poly_client=_poly_client,
-        is_demo=demo_trade_enabled,
-    )
+                trade_id = await queries.insert_trade(
+                    signal_id=signal_id,
+                    slot_start=slot_start_full,
+                    slot_end=slot_end_full,
+                    side=side,
+                    entry_price=entry_price,
+                    amount_usdc=amount_usdc,
+                    status="filled",
+                    is_demo=True,
+                )
+                log.info(
+                    "Demo trade placed: signal=%d trade_id=%d side=%s amount=$%.2f bankroll=$%.2f",
+                    signal_id, trade_id, side, amount_usdc, new_bankroll,
+                )
+                msg = (
+                    f"\U0001f9ea <b>[DEMO] Trade Placed</b>\n"
+                    f"{'\U0001f4c8' if side == 'Up' else '\U0001f4c9'} {side}  @${entry_price:.2f}  "
+                    f"${amount_usdc:.2f}\n"
+                    f"\U0001f4b0 Demo Bankroll: ${new_bankroll:.2f}"
+                )
+                await _send_telegram(msg)
 
-    # 5. Send signal notification
-    msg = format_signal(
-        side=side,
-        entry_price=entry_price,
-        slot_start_str=slot_start_str,
-        slot_end_str=slot_end_str,
-        pattern=pattern,
-    )
-    await _send_telegram(msg)
-
-    # 6. Place trade if autotrade on (with robust retry logic)
-    trade_id: int | None = None
-    amount_usdc: float | None = None
-    slot_label = f"{slot_start_str}-{slot_end_str}"
-
-    if demo_trade_enabled:
-        # -- Demo Trade Path --
-        amount_usdc = round(trade_amount, 2)
-        demo_bankroll = await queries.get_demo_bankroll()
-
-        if demo_bankroll < amount_usdc:
-            log.warning(
-                "Demo bankroll ($%.2f) insufficient for trade amount ($%.2f) — skipping demo trade",
-                demo_bankroll, amount_usdc,
-            )
-            msg = (
-                f"\U0001f9ea <b>[DEMO] Bankroll Insufficient</b>\n"
-                f"Bankroll: ${demo_bankroll:.2f}  |  Required: ${amount_usdc:.2f}\n"
-                f"Demo trade skipped. Top up via /settings."
-            )
-            await _send_telegram(msg)
-        else:
-            new_bankroll = await queries.adjust_demo_bankroll(-amount_usdc)
-
+        elif autotrade and _poly_client is not None and token_id:
+            amount_usdc = round(trade_amount, 2)
             trade_id = await queries.insert_trade(
                 signal_id=signal_id,
                 slot_start=slot_start_full,
@@ -467,157 +493,138 @@ async def _check_and_trade() -> None:
                 side=side,
                 entry_price=entry_price,
                 amount_usdc=amount_usdc,
-                status="filled",
-                is_demo=True,
-            )
-            log.info(
-                "Demo trade placed: signal=%d trade_id=%d side=%s amount=$%.2f bankroll=$%.2f",
-                signal_id, trade_id, side, amount_usdc, new_bankroll,
-            )
-            msg = (
-                f"\U0001f9ea <b>[DEMO] Trade Placed</b>\n"
-                f"{'\U0001f4c8' if side == 'Up' else '\U0001f4c9'} {side}  @${entry_price:.2f}  "
-                f"${amount_usdc:.2f}\n"
-                f"\U0001f4b0 Demo Bankroll: ${new_bankroll:.2f}"
-            )
-            await _send_telegram(msg)
-
-    elif autotrade and _poly_client is not None and token_id:
-        amount_usdc = round(trade_amount, 2)
-        trade_id = await queries.insert_trade(
-            signal_id=signal_id,
-            slot_start=slot_start_full,
-            slot_end=slot_end_full,
-            side=side,
-            entry_price=entry_price,
-            amount_usdc=amount_usdc,
-            status="pending",
-        )
-
-        # Compute slot end timestamp for time-fencing
-        slot_end_ts = slot_ts + SLOT_DURATION
-
-        # Wrap trader to inject retry notifications
-        max_retries = cfg.FOK_MAX_RETRIES
-
-        async def _place_with_notifications():
-            """Thin wrapper: forwards retry-in-progress telegrams, then delegates
-            to trader.place_fok_order_with_retry for the actual order logic."""
-            sent_attempts: set[int] = set()
-
-            async def _retry_watcher():
-                """Poll trade DB row; send a notification on each new attempt."""
-                import asyncio as _asyncio
-                for _ in range(max_retries * 10):  # generous upper bound
-                    await _asyncio.sleep(0.8)
-                    try:
-                        row = await queries.get_active_trade_for_signal(signal_id)
-                        if row is None:
-                            continue
-                        retry_count = row.get("retry_count", 0) or 0
-                        status = row.get("status", "")
-                        if status == "retrying" and retry_count not in sent_attempts:
-                            sent_attempts.add(retry_count)
-                            retry_msg = format_trade_retrying(
-                                side=side,
-                                slot_label=slot_label,
-                                attempt=retry_count + 1,
-                                max_attempts=max_retries,
-                                reason="FOK order not matched — retrying",
-                            )
-                            await _send_telegram(retry_msg)
-                        if status in ("filled", "unmatched", "aborted", "duplicate_prevented"):
-                            break
-                    except Exception:
-                        pass  # watcher is non-critical
-
-            watcher_task = asyncio.create_task(_retry_watcher())
-
-            result = await trader.place_fok_order_with_retry(
-                poly_client=_poly_client,
-                token_id=token_id,
-                amount_usdc=amount_usdc,
-                signal_id=signal_id,
-                trade_id=trade_id,
-                slot_end_ts=slot_end_ts,
+                status="pending",
             )
 
-            watcher_task.cancel()
-            try:
-                await watcher_task
-            except asyncio.CancelledError:
-                pass
+            # Compute slot end timestamp for time-fencing
+            slot_end_ts = slot_ts + SLOT_DURATION
 
-            return result
+            # Wrap trader to inject retry notifications
+            max_retries = cfg.FOK_MAX_RETRIES
 
-        result = await _place_with_notifications()
+            async def _place_with_notifications():
+                """Thin wrapper: forwards retry-in-progress telegrams, then delegates
+                to trader.place_fok_order_with_retry for the actual order logic."""
+                sent_attempts: set[int] = set()
 
-        trade_status = result["status"]
-        attempts = result["attempts"]
-        reason = result["reason"]
-        order_id = result.get("order_id")
+                async def _retry_watcher():
+                    """Poll trade DB row; send a notification on each new attempt."""
+                    import asyncio as _asyncio
+                    for _ in range(max_retries * 10):  # generous upper bound
+                        await _asyncio.sleep(0.8)
+                        try:
+                            row = await queries.get_active_trade_for_signal(signal_id)
+                            if row is None:
+                                continue
+                            retry_count = row.get("retry_count", 0) or 0
+                            status = row.get("status", "")
+                            if status == "retrying" and retry_count not in sent_attempts:
+                                sent_attempts.add(retry_count)
+                                retry_msg = format_trade_retrying(
+                                    side=side,
+                                    slot_label=slot_label,
+                                    attempt=retry_count + 1,
+                                    max_attempts=max_retries,
+                                    reason="FOK order not matched — retrying",
+                                )
+                                await _send_telegram(retry_msg)
+                            if status in ("filled", "unmatched", "aborted", "duplicate_prevented"):
+                                break
+                        except Exception:
+                            pass  # watcher is non-critical
 
-        if trade_status == "filled":
-            log.info("Trade filled: order_id=%s (attempts=%d)", order_id, attempts)
-            shares: float | None = result.get("shares")
-            msg = format_trade_filled(
-                side=side,
-                slot_label=slot_label,
-                ask_price=entry_price,
-                amount_usdc=amount_usdc,
-                shares=shares,
-                order_id=order_id,
-                attempts=attempts,
+                watcher_task = asyncio.create_task(_retry_watcher())
+
+                result = await trader.place_fok_order_with_retry(
+                    poly_client=_poly_client,
+                    token_id=token_id,
+                    amount_usdc=amount_usdc,
+                    signal_id=signal_id,
+                    trade_id=trade_id,
+                    slot_end_ts=slot_end_ts,
+                )
+
+                watcher_task.cancel()
+                try:
+                    await watcher_task
+                except asyncio.CancelledError:
+                    pass
+
+                return result
+
+            result = await _place_with_notifications()
+
+            trade_status = result["status"]
+            attempts = result["attempts"]
+            reason = result["reason"]
+            order_id = result.get("order_id")
+
+            if trade_status == "filled":
+                log.info("Trade filled: order_id=%s (attempts=%d)", order_id, attempts)
+                shares: float | None = result.get("shares")
+                msg = format_trade_filled(
+                    side=side,
+                    slot_label=slot_label,
+                    ask_price=entry_price,
+                    amount_usdc=amount_usdc,
+                    shares=shares,
+                    order_id=order_id,
+                    attempts=attempts,
+                )
+                await _send_telegram(msg)
+
+            elif trade_status == "aborted":
+                log.warning("Trade aborted: %s (attempts=%d)", reason, attempts)
+                msg = format_trade_aborted(
+                    side=side,
+                    slot_label=slot_label,
+                    reason=reason,
+                )
+                await _send_telegram(msg)
+                trade_id = None  # don't resolve a non-filled trade
+
+            else:
+                # unmatched / failed
+                log.warning("Trade %s: %s (attempts=%d)", trade_status, reason, attempts)
+                msg = format_trade_unmatched(
+                    side=side,
+                    slot_label=slot_label,
+                    attempts=attempts,
+                    reason=reason,
+                )
+                await _send_telegram(msg)
+                trade_id = None  # don't resolve a non-filled trade
+
+        # 7. Schedule resolution after slot N+1 ends
+        resolve_time = datetime.fromtimestamp(slot_ts + SLOT_DURATION + 30, tz=timezone.utc)
+        if SCHEDULER is not None:
+            SCHEDULER.add_job(
+                _resolve_and_notify,
+                trigger="date",
+                run_date=resolve_time,
+                kwargs={
+                    "signal_id": signal_id,
+                    "slug": slug,
+                    "side": side,
+                    "entry_price": entry_price,
+                    "slot_start": slot_start_full,
+                    "slot_end": slot_end_full,
+                    "trade_id": trade_id,
+                    "amount_usdc": amount_usdc,
+                    "is_demo": demo_trade_enabled,
+                },
+                id=f"resolve_{signal_id}",
+                replace_existing=True,
             )
-            await _send_telegram(msg)
+            log.debug("Scheduled resolution for signal %d at %s", signal_id, resolve_time.isoformat())
 
-        elif trade_status == "aborted":
-            log.warning("Trade aborted: %s (attempts=%d)", reason, attempts)
-            msg = format_trade_aborted(
-                side=side,
-                slot_label=slot_label,
-                reason=reason,
-            )
-            await _send_telegram(msg)
-            trade_id = None  # don't resolve a non-filled trade
+    except Exception:
+        log.exception("_check_and_trade: unhandled exception — rescheduling next check")
+        await _send_telegram("\u274c Scheduler error in check_and_trade — see logs. Next check rescheduled.")
 
-        else:
-            # unmatched / failed
-            log.warning("Trade %s: %s (attempts=%d)", trade_status, reason, attempts)
-            msg = format_trade_unmatched(
-                side=side,
-                slot_label=slot_label,
-                attempts=attempts,
-                reason=reason,
-            )
-            await _send_telegram(msg)
-            trade_id = None  # don't resolve a non-filled trade
-
-    # 7. Schedule resolution after slot N+1 ends
-    resolve_time = datetime.fromtimestamp(slot_ts + SLOT_DURATION + 30, tz=timezone.utc)
-    if SCHEDULER is not None:
-        SCHEDULER.add_job(
-            _resolve_and_notify,
-            trigger="date",
-            run_date=resolve_time,
-            kwargs={
-                "signal_id": signal_id,
-                "slug": slug,
-                "side": side,
-                "entry_price": entry_price,
-                "slot_start": slot_start_full,
-                "slot_end": slot_end_full,
-                "trade_id": trade_id,
-                "amount_usdc": amount_usdc,
-                "is_demo": demo_trade_enabled,
-            },
-            id=f"resolve_{signal_id}",
-            replace_existing=True,
-        )
-        log.debug("Scheduled resolution for signal %d at %s", signal_id, resolve_time.isoformat())
-
-    # 8. Schedule next check
-    _schedule_next()
+    finally:
+        # Single authoritative reschedule — runs after every return, exception, and normal exit.
+        _schedule_next()
 
 
 def _schedule_next() -> None:
