@@ -662,6 +662,30 @@ def format_retrain_started() -> str:
     )
 
 
+def format_retrain_blocked(meta: dict, threshold: float) -> str:
+    """Notification sent when retrain completes but fails the 59% deployment gate.
+
+    The candidate IS saved — the user must decide to promote or discard.
+    """
+    lines = [
+        SEP,
+        "\u26a0\ufe0f <b>Retrain Complete \u2014 Deployment Gate NOT Passed</b>",
+        SEP,
+        f"Trained     : {str(meta.get('train_date', 'N/A'))[:19]}",
+        f"Val WR      : {meta.get('val_wr', 0)*100:.2f}%",
+        f"Test WR     : {meta.get('test_wr', 0)*100:.2f}%  \u274c  (min 59.00%)",
+        f"Trades/day  : {meta.get('test_trades_per_day', 0):.1f}",
+        f"Threshold   : {threshold:.3f}",
+        f"Samples     : {meta.get('sample_count', 0):,}",
+        SEP,
+        "<b>This candidate did NOT meet Blueprint Rule 10 (test WR \u2265 59%).</b>",
+        "It has been saved to the candidate slot but was <b>not</b> auto-promoted.",
+        "",
+        "Choose an action below:",
+    ]
+    return "\n".join(lines)
+
+
 def format_retrain_complete(meta: dict, threshold: float) -> str:
     """Show retrain results for candidate model."""
     lines = [

@@ -248,25 +248,24 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
 
     # -----------------------------------------------------------------------
     # Deployment gate — Blueprint Rule 10
-    # ALWAYS validate test WR >= 59% before saving/deploying.
-    # If the model fails this gate, raise DeploymentBlockedError so the
-    # caller can handle it (log, alert, keep old model) rather than silently
-    # deploying an underperforming model.
+    # ALWAYS validate test WR >= 59% before auto-deploying.
+    # If the model fails this gate we still save it to the candidate slot
+    # so the user can inspect it and decide whether to promote or discard.
+    # We return blocked=True so the caller can surface the decision to the
+    # user rather than silently keeping or discarding the model.
     # -----------------------------------------------------------------------
     MIN_DEPLOY_WR = 0.59
-    if test_metrics["wr"] < MIN_DEPLOY_WR:
-        log.critical(
+    blocked = test_metrics["wr"] < MIN_DEPLOY_WR
+    if blocked:
+        log.warning(
             "DEPLOYMENT BLOCKED: test_wr=%.4f is below minimum %.2f "
-            "(Blueprint Rule 10). Model NOT saved. Investigate data quality "
-            "or wait for a better market regime before retraining.",
+            "(Blueprint Rule 10). Model saved to candidate slot — "
+            "user must decide whether to promote or discard.",
             test_metrics["wr"], MIN_DEPLOY_WR,
         )
-        raise DeploymentBlockedError(
-            f"Test WR {test_metrics['wr']:.4f} < {MIN_DEPLOY_WR} — "
-            "model does not meet deployment standard (Blueprint Rule 10)."
-        )
 
-    # Save model and metadata
+    # Save model and metadata to candidate slot regardless of gate result.
+    # The caller decides what to do with a blocked candidate.
     metadata = {
         "train_date": datetime.utcnow().isoformat(),
         "threshold": best_threshold,
@@ -282,6 +281,7 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         "test_size": n - train_end,
         "feature_cols": FEATURE_COLS,
         "best_iteration": model.best_iteration,
+        "blocked": blocked,
     }
     model_store.save_model(model, slot, metadata)
 
@@ -292,4 +292,9 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         "val_wr": best_wr,
         "val_trades": best_trades_per_day,
         "best_iteration": model.best_iteration,
+        "blocked": blocked,
+        "warning_reason": (
+            f"Test WR {test_metrics['wr']*100:.2f}% is below the 59% deployment gate "
+            f"(Blueprint Rule 10). Candidate saved but NOT auto-promoted."
+        ) if blocked else None,
     }

@@ -90,6 +90,16 @@ def has_model(slot: str = "current") -> bool:
     return os.path.exists(_model_path(slot))
 
 
+def delete_model(slot: str) -> None:
+    """Delete model file and metadata for the given slot. Safe to call if missing."""
+    for path in (_model_path(slot), _meta_path(slot)):
+        try:
+            os.remove(path)
+            log.info("delete_model: removed %s", path)
+        except FileNotFoundError:
+            pass
+
+
 async def save_model_to_db(model: lgb.Booster, slot: str, metadata: dict) -> None:
     """Serialize model to bytes and upsert into model_blobs table in SQLite."""
     import tempfile, os, json

@@ -218,6 +218,20 @@ def pattern_keyboard() -> InlineKeyboardMarkup:
 # ML Model submenu
 # ---------------------------------------------------------------------------
 
+def retrain_blocked_keyboard() -> InlineKeyboardMarkup:
+    """Shown after a retrain that failed the 59% deployment gate.
+
+    Candidate is already saved — user picks Promote Anyway or Discard.
+    """
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\u26a0\ufe0f Promote Anyway", callback_data="ml_promote_anyway"),
+            InlineKeyboardButton("\U0001f5d1 Discard Candidate", callback_data="ml_discard_candidate"),
+        ],
+        [InlineKeyboardButton("\U0001f519 Back to Menu", callback_data="cmd_menu")],
+    ])
+
+
 def ml_menu() -> InlineKeyboardMarkup:
     """Inline keyboard for the ML Model submenu."""
     return InlineKeyboardMarkup([

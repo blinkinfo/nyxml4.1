@@ -34,6 +34,7 @@ from bot.formatters import (
     format_redeem_preview,
     format_redeem_results,
     format_redemption_history,
+    format_retrain_blocked,
     format_retrain_complete,
     format_retrain_started,
     format_signal_stats,
@@ -49,6 +50,7 @@ from bot.keyboards import (
     pattern_keyboard,
     redeem_confirm_keyboard,
     redeem_done_keyboard,
+    retrain_blocked_keyboard,
     settings_keyboard,
     signal_filter_row,
     trade_filter_row,
@@ -591,6 +593,44 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
         await cmd_retrain(update, context)
 
+    elif data == "ml_promote_anyway":
+        await query.answer()
+        # User explicitly chose to promote a blocked candidate
+        from ml import model_store
+        from core.strategies.ml_strategy import request_model_reload
+        if not model_store.has_model("candidate"):
+            await query.message.reply_text(
+                "\u274c No candidate model found. Please retrain first.",
+                parse_mode="HTML",
+                reply_markup=ml_menu(),
+            )
+        else:
+            model_store.promote_candidate()
+            request_model_reload()
+            meta = model_store.load_metadata("current") or {}
+            threshold = await queries.get_ml_threshold()
+            text = format_model_status("current (force-promoted)", meta, threshold)
+            await query.message.reply_text(
+                f"{text}\n\n\u26a0\ufe0f Candidate promoted despite failing the 59% gate. "
+                "Monitor live performance closely.",
+                parse_mode="HTML",
+                reply_markup=ml_menu(),
+            )
+
+    elif data == "ml_discard_candidate":
+        await query.answer()
+        # User chose to discard the blocked candidate
+        from ml import model_store
+        if model_store.has_model("candidate"):
+            model_store.delete_model("candidate")
+        await _safe_edit(
+            query,
+            "\U0001f5d1 <b>Candidate discarded.</b>\n\n"
+            "The blocked candidate has been removed. "
+            "The current production model is unchanged.",
+            reply_markup=ml_menu(),
+        )
+
     elif data == "ml_set_threshold":
         await query.answer()
         threshold = await queries.get_ml_threshold()
@@ -998,12 +1038,16 @@ async def cmd_retrain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def _retrain_background(application, chat_id) -> None:
     """Background retraining: fetch data, build features, train, save to DB, report."""
     import asyncio as _asyncio
+    import html as _html
     from ml import data_fetcher, features as feat_eng, trainer, model_store
 
-    async def notify(text: str) -> None:
+    async def notify(text: str, reply_markup=None) -> None:
         try:
             await application.bot.send_message(
-                chat_id=int(chat_id), text=text, parse_mode="HTML"
+                chat_id=int(chat_id),
+                text=text,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
             )
         except Exception as e:
             log.warning("_retrain_background: failed to send notification: %s", e)
@@ -1031,8 +1075,6 @@ async def _retrain_background(application, chat_id) -> None:
         )
         meta = model_store.load_metadata("candidate") or {}
         threshold = result.get("threshold", 0.535)
-        best_iteration = result.get("best_iteration", result.get("best_iter", 0))
-        auc = result.get("auc", result.get("val_auc", meta.get("auc", 0.0)))
 
         # Persist trained candidate model to DB
         try:
@@ -1040,15 +1082,28 @@ async def _retrain_background(application, chat_id) -> None:
         except Exception as db_exc:
             log.warning("Retrain: failed to save candidate to DB: %s", db_exc)
 
-        await notify(
-            f"Retrain complete! Best iteration: {best_iteration}, "
-            f"AUC: {auc:.4f}, Threshold: {threshold:.3f}"
-        )
-        log.info("Retrain complete. val_wr=%.4f", result.get("val_wr", 0))
+        if result.get("blocked"):
+            # Model failed the 59% gate — saved to candidate, user decides
+            log.warning(
+                "Retrain: candidate blocked by deployment gate. "
+                "val_wr=%.4f test_wr=%.4f threshold=%.3f",
+                result.get("val_wr", 0),
+                result.get("test_metrics", {}).get("wr", 0),
+                threshold,
+            )
+            text = format_retrain_blocked(meta, threshold)
+            await notify(text, reply_markup=retrain_blocked_keyboard())
+        else:
+            log.info("Retrain complete. val_wr=%.4f test_wr=%.4f",
+                     result.get("val_wr", 0),
+                     result.get("test_metrics", {}).get("wr", 0))
+            text = format_retrain_complete(meta, threshold)
+            await notify(text)
 
     except _asyncio.TimeoutError:
         log.error("Retrain background task timed out after 25 min")
         await notify("Retrain timed out after 25 min. Try again or check Railway logs.")
     except Exception as exc:
         log.exception("Retrain background task failed: %s", exc)
-        await notify(f"Retrain failed: {exc}. Check Railway logs.")
+        safe_msg = _html.escape(str(exc))
+        await notify(f"\u274c <b>Retrain failed</b>\n\n{safe_msg}\n\nCheck Railway logs for details.")
