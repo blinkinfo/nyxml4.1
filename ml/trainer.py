@@ -66,19 +66,33 @@ WF_STEP_PCT = (1.0 - WF_INITIAL_PCT) / WF_FOLDS
 # Threshold sweep (val set only — never test set)
 # ---------------------------------------------------------------------------
 
+# Minimum number of trades required at a threshold before it is considered a
+# valid candidate.  With fewer trades the win-rate estimate is too noisy to be
+# meaningful (e.g. 5 trades → WR can swing 20 pp from a single outcome).
+# 30 trades gives a reasonable sample while still leaving room to select higher
+# thresholds on typical val-set sizes.
+MIN_TRADES = 30
+
 def sweep_threshold(
     probs: np.ndarray,
     y_true: np.ndarray,
     lo: float = 0.50,
     hi: float = 0.80,
-    step: float = 0.005,
+    step: float = 0.02,
 ) -> tuple[float, float, float]:
     """Sweep thresholds on val set and select best.
 
     Selection criteria:
-      - If any threshold achieves WR >= 0.58: pick the one that maximizes
-        (WR - 0.5) * trades_per_day  (edge-weighted activity score).
-      - Otherwise: pick threshold with maximum WR.
+      - Thresholds with fewer than MIN_TRADES trades are skipped — the WR
+        estimate is too noisy to be meaningful on small samples.
+      - If any remaining threshold achieves WR >= 0.58: pick the one that
+        maximizes (WR - 0.5) * trades_per_day  (edge-weighted activity score).
+      - Otherwise: pick threshold with maximum WR (among those >= MIN_TRADES).
+
+    Step is intentionally coarse (0.02) to reduce overfitting on small val
+    slices.  Fine steps (e.g. 0.005) produce 61 candidates on a small slice
+    and reliably find a lucky threshold; 0.02 gives 16 candidates while still
+    covering the full 0.50–0.80 range.
 
     Returns:
       (best_threshold, best_wr, trades_per_day)
@@ -91,14 +105,14 @@ def sweep_threshold(
     best_trades = 0
     best_trades_per_day = 0.0
 
-    # First pass: find candidates with WR >= 0.58
+    # First pass: find candidates with WR >= 0.58 AND trades >= MIN_TRADES
     candidates_above = []
 
     thresh = lo
     while thresh <= hi + 1e-9:
         mask = probs >= thresh
         trades = int(mask.sum())
-        if trades > 0:
+        if trades >= MIN_TRADES:
             wr = float(y_true[mask].mean())
             tpd = trades / (len(probs) * 5 / 1440)
             if wr >= 0.58:
@@ -121,13 +135,15 @@ def sweep_threshold(
             (best_wr - 0.5) * best_trades_per_day,
         )
     else:
-        # No candidate >= 0.58: pick max WR
+        # No candidate >= 0.58 with enough trades: pick max WR among those >= MIN_TRADES.
+        # Fall back to lo with trades=0 only if no threshold meets the MIN_TRADES floor
+        # (e.g. extremely small val slice — should not happen in normal operation).
         best_wr_val = 0.0
         thresh = lo
         while thresh <= hi + 1e-9:
             mask = probs >= thresh
             trades = int(mask.sum())
-            if trades > 0:
+            if trades >= MIN_TRADES:
                 wr = float(y_true[mask].mean())
                 tpd = trades / (len(probs) * 5 / 1440)
                 if wr > best_wr_val or (wr == best_wr_val and trades > best_trades):
@@ -138,8 +154,8 @@ def sweep_threshold(
                     best_trades_per_day = tpd
             thresh = round(thresh + step, 4)
         log.warning(
-            "sweep_threshold: no threshold achieves WR>=0.58, best=%.3f WR=%.4f",
-            best_threshold, best_wr,
+            "sweep_threshold: no threshold achieves WR>=0.58 (min_trades=%d), best=%.3f WR=%.4f",
+            MIN_TRADES, best_threshold, best_wr,
         )
 
     return best_threshold, best_wr, best_trades_per_day
