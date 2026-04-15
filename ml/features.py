@@ -8,7 +8,7 @@ Target semantics: 1 if the NEXT candle closes at or above its own open
 (resolver.py: winner = "Up" if close_price >= open_price else "Down").
 
 32 features total: candle shape (7), volume (2), 15m context (3), 1h context (3),
-funding (2), CVD (5), time-of-day cyclical (4), volatility regime (2),
+funding (2), OHLCV pressure (5), time-of-day cyclical (4), volatility regime (2),
 momentum (4: rsi14, candle_streak, price_in_range, ema_cross_5m).
 """
 
@@ -33,7 +33,7 @@ FEATURE_COLS = [
     "body_ratio_15m", "dir_15m", "volume_ratio_15m",
     "body_ratio_1h", "dir_1h", "ema9_slope_1h",
     "funding_rate", "funding_zscore",
-    "delta_ratio", "cvd_delta", "cvd_5", "cvd_20", "cvd_trend",
+    "body_ratio", "upper_wick_ratio", "lower_wick_ratio", "vol_zscore", "vol_trend",
     "hour_sin", "hour_cos", "dow_sin", "dow_cos",  # cyclical time (replaces hour_utc, dow)
     "atr_percentile_24h", "vol_regime",
     "rsi14", "candle_streak", "price_in_range", "ema_cross_5m",  # momentum features
@@ -116,7 +116,6 @@ def build_features(
     df15: pd.DataFrame,
     df1h: pd.DataFrame,
     funding: pd.DataFrame,
-    cvd: pd.DataFrame,
 ) -> pd.DataFrame:
     """Build 32 features per BLUEPRINT sections 4-6. Returns df with FEATURE_COLS + 'target'."""
 
@@ -125,17 +124,15 @@ def build_features(
     df15 = df15.copy().reset_index(drop=True)
     df1h = df1h.copy().reset_index(drop=True)
     funding = funding.copy().reset_index(drop=True)
-    cvd = cvd.copy().reset_index(drop=True)
 
     # Sort ascending (should already be sorted, but be safe)
     df5 = df5.sort_values("timestamp").reset_index(drop=True)
     df15 = df15.sort_values("timestamp").reset_index(drop=True)
     df1h = df1h.sort_values("timestamp").reset_index(drop=True)
     funding = funding.sort_values("timestamp").reset_index(drop=True)
-    cvd = cvd.sort_values("timestamp").reset_index(drop=True)
 
     # Normalize all timestamps to ms UTC for consistent merging
-    for df in [df5, df15, df1h, funding, cvd]:
+    for df in [df5, df15, df1h, funding]:
         df["timestamp"] = df["timestamp"].astype("datetime64[ms, UTC]")
 
     # -----------------------------------------------------------------------
@@ -215,30 +212,31 @@ def build_features(
     df5["funding_zscore"] = rf["funding_zscore"].values
 
     # -----------------------------------------------------------------------
-    # CVD features — merge on exact timestamp then shift(1)
+    # OHLCV-native pressure features — computed purely from df5, zero parity gap
     # -----------------------------------------------------------------------
-    # Normalize CVD timestamps to ms to match df5
-    cvd["timestamp"] = cvd["timestamp"].astype("datetime64[ms, UTC]")
+    hl_range = (df5["high"] - df5["low"]).clip(lower=1e-9)
+    body      = df5["close"] - df5["open"]
 
-    atr_cvd = compute_atr14(cvd)
-    cvd["delta"] = cvd["buy_vol"] - cvd["sell_vol"]
-    denom = (cvd["buy_vol"] + cvd["sell_vol"]).clip(lower=1e-8)
-    cvd["delta_ratio_raw"] = cvd["buy_vol"] / denom
-    cvd["cvd_delta_raw"] = cvd["delta"] / atr_cvd
-    cvd["cvd_5_raw"] = cvd["delta"].rolling(5).sum() / atr_cvd
-    cvd["cvd_20_raw"] = cvd["delta"].rolling(20).sum() / atr_cvd
-    cvd["cvd_trend_raw"] = cvd["cvd_5_raw"] - cvd["cvd_20_raw"]
+    # body_ratio: candle body direction and strength, [-1, 1]
+    df5["body_ratio"] = (body / hl_range).clip(-1.0, 1.0).shift(1)
 
-    # Merge CVD on df5['timestamp'] directly (same 5m grid), then shift result by 1
-    cvd_cols = ["delta_ratio_raw", "cvd_delta_raw", "cvd_5_raw", "cvd_20_raw", "cvd_trend_raw"]
-    rcvd = _asof_backward(df5["timestamp"], cvd, cvd_cols)
+    # upper_wick_ratio: selling rejection at highs, [0, 1]
+    upper_wick = df5["high"] - df5[["open", "close"]].max(axis=1)
+    df5["upper_wick_ratio"] = (upper_wick / hl_range).clip(0.0, 1.0).shift(1)
 
-    # shift by 1 to prevent lookahead (use N-1 CVD value)
-    df5["delta_ratio"] = rcvd["delta_ratio_raw"].shift(1).values
-    df5["cvd_delta"] = rcvd["cvd_delta_raw"].shift(1).values
-    df5["cvd_5"] = rcvd["cvd_5_raw"].shift(1).values
-    df5["cvd_20"] = rcvd["cvd_20_raw"].shift(1).values
-    df5["cvd_trend"] = rcvd["cvd_trend_raw"].shift(1).values
+    # lower_wick_ratio: buying rejection at lows, [0, 1]
+    lower_wick = df5[["open", "close"]].min(axis=1) - df5["low"]
+    df5["lower_wick_ratio"] = (lower_wick / hl_range).clip(0.0, 1.0).shift(1)
+
+    # vol_zscore: volume surge detection vs 20-bar rolling mean/std
+    vol_mean20 = df5["volume"].rolling(20).mean()
+    vol_std20  = df5["volume"].rolling(20).std(ddof=1).clip(lower=1e-8)
+    df5["vol_zscore"] = ((df5["volume"] - vol_mean20) / vol_std20).shift(1)
+
+    # vol_trend: short vs long volume momentum (5-bar / 20-bar rolling mean)
+    vol_ma5  = df5["volume"].rolling(5).mean()
+    vol_ma20 = df5["volume"].rolling(20).mean().clip(lower=1e-8)
+    df5["vol_trend"] = (vol_ma5 / vol_ma20).shift(1)
 
     # -----------------------------------------------------------------------
     # Time-of-day cyclical features — derived from N-1 candle timestamp
@@ -335,7 +333,6 @@ def build_live_features(
     df1h_live: pd.DataFrame,
     funding_rate_float: float | None,
     funding_buffer: deque,
-    cvd_live: pd.DataFrame,
 ) -> "tuple[np.ndarray, list[str]] | tuple[None, list[str]]":
     """
     Build a single feature row (shape 1×32) for live inference.
@@ -357,7 +354,6 @@ def build_live_features(
     df5 = df5_live.copy().reset_index(drop=True)
     df15 = df15_live.copy().reset_index(drop=True)
     df1h = df1h_live.copy().reset_index(drop=True)
-    cvd = cvd_live.copy().reset_index(drop=True) if cvd_live is not None and len(cvd_live) > 0 else pd.DataFrame()
 
     # Normalize timestamps
     for df in [df5, df15, df1h]:
@@ -475,50 +471,38 @@ def build_live_features(
         fr = np.nan
         funding_zscore = np.nan
 
-    # CVD features
-    if len(cvd) >= 14 and "buy_vol" in cvd.columns:
-        cvd["timestamp"] = pd.to_datetime(cvd["timestamp"], utc=True).astype("datetime64[ms, UTC]")
-        atr_cvd = compute_atr14(cvd)
-        cvd["delta"] = cvd["buy_vol"] - cvd["sell_vol"]
-        denom = (cvd["buy_vol"] + cvd["sell_vol"]).clip(lower=1e-8)
-        cvd["delta_ratio_raw"] = cvd["buy_vol"] / denom
-        cvd["cvd_delta_raw"] = cvd["delta"] / atr_cvd
-        cvd["cvd_5_raw"] = cvd["delta"].rolling(5).sum() / atr_cvd
-        cvd["cvd_20_raw"] = cvd["delta"].rolling(20).sum() / atr_cvd
-        cvd["cvd_trend_raw"] = cvd["cvd_5_raw"] - cvd["cvd_20_raw"]
+    # OHLCV-native pressure features (live) — identical formulas to build_features
+    # All use N-1 candle (index -2 after the still-forming candle is trimmed by caller)
+    hl_range_live = (df5["high"] - df5["low"]).clip(lower=1e-9)
+    body_live      = df5["close"] - df5["open"]
 
-        # CVD index parity with training — use len(cvd) - 2.
-        #
-        # TRAINING PATH (build_features):
-        #   rcvd = _asof_backward(df5["timestamp"], cvd, cols)
-        #     → same-grid merge: rcvd.iloc[i] = CVD row at df5.timestamp[i]
-        #   df5["delta_ratio"] = rcvd["delta_ratio_raw"].shift(1)
-        #     → prediction row i uses rcvd.iloc[i-1] = CVD row i-1
-        #   train_feat.iloc[-2] corresponds to df5 row (n-2), so shift(1)
-        #   gives rcvd.iloc[n-3] where n = len(df5).  With df5 having n5=450
-        #   rows, that is rcvd.iloc[447] = CVD row 447 in the original array.
-        #
-        # LIVE PATH (build_live_features):
-        #   ml_strategy.py trims both df5 and cvd_live with .iloc[:-1] before
-        #   calling this function, dropping the still-forming candle.
-        #   After trimming: len(cvd) = original_len - 1.
-        #   The last complete prediction row in live corresponds to
-        #   df5[-2] (N-1).  Training's shift(1) at that row gives CVD row N-2
-        #   in the original array, which is index len(cvd_trimmed) - 2 = len(cvd) - 2.
-        #
-        #   Verified numerically: cvd_trimmed.iloc[len-2] matches training's
-        #   desired CVD values exactly for all 5 CVD features.
-        idx_cvd = len(cvd) - 2
-        if idx_cvd >= 0:
-            delta_ratio = cvd["delta_ratio_raw"].iloc[idx_cvd]
-            cvd_delta = cvd["cvd_delta_raw"].iloc[idx_cvd]
-            cvd_5 = cvd["cvd_5_raw"].iloc[idx_cvd]
-            cvd_20 = cvd["cvd_20_raw"].iloc[idx_cvd]
-            cvd_trend = cvd["cvd_trend_raw"].iloc[idx_cvd]
-        else:
-            delta_ratio = cvd_delta = cvd_5 = cvd_20 = cvd_trend = np.nan
+    # body_ratio: [-1, 1]
+    body_ratio = float(np.clip(body_live.iloc[-2] / hl_range_live.iloc[-2], -1.0, 1.0))
+
+    # upper_wick_ratio: [0, 1]
+    upper_wick_live = df5["high"] - df5[["open", "close"]].max(axis=1)
+    upper_wick_ratio = float(np.clip(upper_wick_live.iloc[-2] / hl_range_live.iloc[-2], 0.0, 1.0))
+
+    # lower_wick_ratio: [0, 1]
+    lower_wick_live = df5[["open", "close"]].min(axis=1) - df5["low"]
+    lower_wick_ratio = float(np.clip(lower_wick_live.iloc[-2] / hl_range_live.iloc[-2], 0.0, 1.0))
+
+    # vol_zscore: (vol_n1 - mean20) / std20, window ends at N-1 (index -2)
+    if len(df5) >= 21:
+        vol_window = df5["volume"].iloc[-21:-1]  # 20 bars ending at N-1 inclusive
+        v_mean = float(vol_window.mean())
+        v_std  = float(vol_window.std(ddof=1))
+        vol_zscore = (float(df5["volume"].iloc[-2]) - v_mean) / max(v_std, 1e-8)
     else:
-        delta_ratio = cvd_delta = cvd_5 = cvd_20 = cvd_trend = np.nan
+        vol_zscore = np.nan
+
+    # vol_trend: ma5 / ma20 at N-1
+    if len(df5) >= 21:
+        vol_ma5_live  = float(df5["volume"].iloc[-6:-1].mean())   # 5 bars ending at N-1
+        vol_ma20_live = float(df5["volume"].iloc[-21:-1].mean())  # 20 bars ending at N-1
+        vol_trend = vol_ma5_live / max(vol_ma20_live, 1e-8)
+    else:
+        vol_trend = np.nan
 
     # -----------------------------------------------------------------------
     # Time-of-day cyclical features — use N-1 candle timestamp (index -2)
@@ -586,14 +570,16 @@ def build_live_features(
     else:
         rsi14 = np.nan
 
-    # candle_streak (live): consecutive same-direction candles ending at N-1
+    # candle_streak (live): consecutive same-direction candles BEFORE N-1
+    # Training uses _streak.shift(1) at row N-1, which gives the streak count
+    # accumulated by candles N-2 and earlier — N-1 itself does NOT contribute.
+    # So we use N-1's direction as the reference but only walk back from N-2 onward.
     if len(df5) >= 2:
         dir_live = np.sign(df5["close"].values - df5["open"].values)
-        # Walk backwards from N-1 (index -2) counting same direction
+        ref_dir = dir_live[-2]  # N-1 direction (reference, not counted)
         streak_val = 0.0
-        ref_dir = dir_live[-2]  # N-1 direction
         if ref_dir != 0:
-            streak_val = 1.0
+            # Walk backwards from N-2 (index -3) counting same-direction candles
             for k in range(3, len(dir_live) + 1):
                 if dir_live[-k] == ref_dir:
                     streak_val += 1.0
@@ -641,7 +627,7 @@ def build_live_features(
         body_ratio_15m, dir_15m, vol_ratio_15m,
         body_ratio_1h, dir_1h, ema9_slope_1h,
         fr, funding_zscore,
-        delta_ratio, cvd_delta, cvd_5, cvd_20, cvd_trend,
+        body_ratio, upper_wick_ratio, lower_wick_ratio, vol_zscore, vol_trend,
         hour_sin, hour_cos, dow_sin, dow_cos,
         atr_percentile_24h, vol_regime,
         rsi14, candle_streak, price_in_range, ema_cross_5m,

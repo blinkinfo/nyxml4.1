@@ -521,9 +521,10 @@ def fetch_cvd(start_ms: int, end_ms: int) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def fetch_all(months: int = 5) -> dict:
-    """Fetch all 5 data sources for the last `months` months.
+    """Fetch all 4 data sources for the last `months` months.
 
-    Returns dict with keys: df5, df15, df1h, funding, cvd
+    Returns dict with keys: df5, df15, df1h, funding
+    (CVD removed — pressure features now derived from OHLCV only)
     """
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=months * 30)
@@ -548,11 +549,7 @@ def fetch_all(months: int = 5) -> dict:
     funding = fetch_funding(start_ms, end_ms)
     print(f"  -> {len(funding)} funding records")
 
-    print("  Fetching CVD data (kline directional estimator)...")
-    cvd = fetch_cvd(start_ms, end_ms)
-    print(f"  -> {len(cvd)} CVD candles")
-
-    return {"df5": df5, "df15": df15, "df1h": df1h, "funding": funding, "cvd": cvd}
+    return {"df5": df5, "df15": df15, "df1h": df1h, "funding": funding}
 
 
 # ---------------------------------------------------------------------------

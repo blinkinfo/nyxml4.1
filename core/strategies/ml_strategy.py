@@ -232,19 +232,18 @@ class MLStrategy(BaseStrategy):
         try:
             # Fetch live data in parallel using executor (blocking ccxt calls)
             loop = asyncio.get_running_loop()
-            df5, df15, df1h, funding_rate, cvd_live = await asyncio.gather(
+            df5, df15, df1h, funding_rate = await asyncio.gather(
                 loop.run_in_executor(None, lambda: data_fetcher.fetch_live_5m(400)),
                 loop.run_in_executor(None, lambda: data_fetcher.fetch_live_15m(100)),
                 loop.run_in_executor(None, lambda: data_fetcher.fetch_live_1h(60)),
                 loop.run_in_executor(None, data_fetcher.fetch_live_funding),
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_cvd(400)),
             )
 
             # --- Data quality snapshot (before dropping the forming candle) ---
-            df5_rows_raw  = len(df5)        if df5       is not None else 0
-            df15_rows     = len(df15)       if df15      is not None else 0
-            df1h_rows     = len(df1h)       if df1h      is not None else 0
-            cvd_rows_raw  = len(cvd_live)   if cvd_live  is not None and len(cvd_live) > 0 else 0
+            df5_rows_raw  = len(df5)  if df5  is not None else 0
+            df15_rows     = len(df15) if df15 is not None else 0
+            df1h_rows     = len(df1h) if df1h is not None else 0
+            cvd_rows_raw  = 0  # CVD removed — features now derived from OHLCV only
 
             # Drop the still-forming 5m candle so inference uses data only up to N-1.
             #
@@ -255,11 +254,10 @@ class MLStrategy(BaseStrategy):
             # Dropping 15m/1h pre-emptively can shift those context features one
             # bucket stale vs training and create train/live feature drift.
             df5 = df5.iloc[:-1].reset_index(drop=True)
-            cvd_live = cvd_live.iloc[:-1].reset_index(drop=True) if cvd_live is not None and len(cvd_live) > 0 else cvd_live
 
             # Row counts after trimming (what the model actually sees)
             df5_rows  = len(df5)
-            cvd_rows  = len(cvd_live) if cvd_live is not None and len(cvd_live) > 0 else 0
+            cvd_rows  = 0  # CVD removed — features now derived from OHLCV only
 
             # N-1 candle metadata for the log
             candle_n1_ts    = None
@@ -298,7 +296,7 @@ class MLStrategy(BaseStrategy):
 
             # Build feature row — returns (row, nan_features) 2-tuple
             feature_row, nan_features = feat_eng.build_live_features(
-                df5, df15, df1h, funding_rate, self._funding_buffer, cvd_live
+                df5, df15, df1h, funding_rate, self._funding_buffer
             )
             if feature_row is None:
                 log.warning("MLStrategy: insufficient data for features, skipping")
