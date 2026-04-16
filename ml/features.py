@@ -26,7 +26,7 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Feature column order — MUST match exactly (37 features)
+# Feature column order — MUST match exactly (42 features)
 # ---------------------------------------------------------------------------
 FEATURE_COLS = [
     "body_ratio_n1", "body_ratio_n2", "body_ratio_n3",
@@ -128,16 +128,26 @@ def build_features(
     funding: pd.DataFrame,
     cvd: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Build 37 features per BLUEPRINT sections 4-6. Returns df with FEATURE_COLS + 'target'.
+    """Build 42 features per BLUEPRINT sections 4-6. Returns df with FEATURE_COLS + 'target'.
 
     Args:
         df5:     5m OHLCV candles from MEXC spot.
         df15:    15m OHLCV candles from MEXC futures.
         df1h:    1h OHLCV candles from MEXC futures.
         funding: Funding rate history from MEXC futures.
-        cvd:     Gate.io 5m taker volume (long_taker_size, short_taker_size).
-                 If None or empty, cvd_ratio defaults to 0.5 and cvd_delta_norm
-                 to 0.0 (neutral — no directional information available).
+        cvd:     Gate.io 5m taker volume DataFrame with columns:
+                 timestamp, long_taker_size, short_taker_size, open_interest.
+                 Used to compute 7 CVD/OI features:
+                   - cvd_ratio:         long_taker_size / (long + short), clamped [0, 1]
+                   - cvd_delta_norm:    (long - short) / ATR5, ATR-normalised delta
+                   - cvd_cumulative_5:  rolling 5-bar sum of delta / ATR5, shift(1)
+                   - cvd_cumulative_20: rolling 20-bar sum of delta / ATR5, shift(1)
+                   - cvd_trend_slope:   OLS slope of delta over rolling 10-bar window / ATR5, shift(1)
+                   - cvd_divergence:    +1 price/CVD disagree, -1 agree, 0 flat (5-bar window, shift(1))
+                   - oi_change_5bar:    (oi[t-1] - oi[t-6]) / |oi[t-6]|, pct change over 5 bars
+                 If None or empty, cvd_ratio defaults to 0.5, cvd_delta_norm to 0.0,
+                 and all 5 accumulation/OI features default to 0.0
+                 (neutral — no directional information available).
     """
 
     # Work on copies with clean RangeIndex
@@ -428,18 +438,25 @@ def build_features(
         _atr_merged = _asof_backward(
             cvd_clean["timestamp"], _df5_atr, ["atr5_for_cvd"]
         )
-        _cvd_atr = _atr_merged["atr5_for_cvd"].clip(lower=1e-9).values
+        _cvd_atr = _atr_merged["atr5_for_cvd"].clip(lower=1e-9)
+        # _atr_s1: ATR at the bar BEFORE each CVD bar (shift(1) with proper index).
+        # Using the Series directly (not wrapping in pd.Series()) preserves the
+        # RangeIndex alignment with cvd_clean and eliminates any positional mismatch.
+        _atr_s1 = _cvd_atr.shift(1)
 
         # cvd_cumulative_5: rolling sum of delta over 5 bars, then shift(1)
+        # shift(1) moves the window one bar back so the value at CVD bar t represents
+        # the sum of bars [t-5 .. t-1] — matching the live path which uses bars ending
+        # at N-2 (one bar before the N-1 bar used as the merge anchor).
         cvd_clean["cvd_cumulative_5"] = (
             cvd_clean["cvd_delta"].rolling(5, min_periods=2).sum().shift(1)
-            / pd.Series(_cvd_atr).shift(1).clip(lower=1e-9)
+            / _atr_s1.clip(lower=1e-9)
         )
 
         # cvd_cumulative_20: rolling sum of delta over 20 bars, then shift(1)
         cvd_clean["cvd_cumulative_20"] = (
             cvd_clean["cvd_delta"].rolling(20, min_periods=5).sum().shift(1)
-            / pd.Series(_cvd_atr).shift(1).clip(lower=1e-9)
+            / _atr_s1.clip(lower=1e-9)
         )
 
         # cvd_trend_slope: OLS slope of cvd_delta over rolling 10-bar window, shift(1)
@@ -462,18 +479,22 @@ def build_features(
             .rolling(10, min_periods=3)
             .apply(_slope, raw=True)
             .shift(1)
-            / pd.Series(_cvd_atr).shift(1).clip(lower=1e-9)
+            / _atr_s1.clip(lower=1e-9)
         )
 
         # cvd_divergence: sign disagreement between price direction and CVD direction
-        # price_dir_5: sign of sum of (close-open) over last 5 bars, shift(1)
-        # We need price data on the CVD frame — merge df5 close/open via asof.
+        # price_dir_5: sign of sum of (close-open) over last 5 bars ending at t-1.
+        # We pre-shift body5_sum in df5 coordinates BEFORE merging so that after
+        # _asof_backward the merged value at each CVD timestamp already reflects
+        # the price-body sum ending one 5m candle before that CVD bar.
+        # This is equivalent to (and consistent with) the live path which reads
+        # df5[-6:-1] (5 closed candles ending at N-1, not including forming bar N).
         _df5_body = pd.DataFrame({
             "timestamp": df5["timestamp"].values,
-            "body5_sum": (df5["close"] - df5["open"]).rolling(5, min_periods=2).sum().values,
+            "body5_sum": (df5["close"] - df5["open"]).rolling(5, min_periods=2).sum().shift(1).values,
         })
         _body_merged = _asof_backward(cvd_clean["timestamp"], _df5_body, ["body5_sum"])
-        _price_dir_5 = np.sign(_body_merged["body5_sum"].shift(1).values)
+        _price_dir_5 = np.sign(_body_merged["body5_sum"].values)
         _cvd_dir_5 = np.sign(
             cvd_clean["cvd_delta"].rolling(5, min_periods=2).sum().shift(1).values
         )
@@ -940,18 +961,20 @@ def build_live_features(
     # Mirrors build_features() exactly:
     #   cvd_ratio          = long_taker_size / (long + short), clamped [0, 1]
     #   cvd_delta_norm     = (long - short) / atr5_val  (ATR-normalized)
-    #   cvd_cumulative_5   = sum(delta[-6:-1]) / atr5_val  (5-bar rolling sum)
-    #   cvd_cumulative_20  = sum(delta[-21:-1]) / atr5_val (20-bar rolling sum)
-    #   cvd_trend_slope    = OLS slope of delta[-11:-1] / atr5_val (10-bar window)
-    #   cvd_divergence     = +1 disagree / -1 agree / 0 flat (price vs CVD dir, 5 bars)
-    #   oi_change_5bar     = (oi[-2] - oi[-7]) / |oi[-7]|  (pct change over 5 bars)
+    #   cvd_cumulative_5   = sum(delta[-6:-2]) / atr5_val  (5-bar rolling sum ending at N-2)
+    #   cvd_cumulative_20  = sum(delta[-21:-2]) / atr5_val (20-bar rolling sum ending at N-2)
+    #   cvd_trend_slope    = OLS slope of delta[-11:-2] / atr5_val (10-bar window ending at N-2)
+    #   cvd_divergence     = +1 disagree / -1 agree / 0 flat (price vs CVD dir, 5-bar window ending at N-2)
+    #   oi_change_5bar     = (oi[-2] - oi[-7]) / |oi[-7]|  (N-2 vs N-7, matches training shift(1)/shift(6))
     #
-    # We look up the last CVD candle whose timestamp <= ts_n1_live (N-1 bar).
-    # The slice ending at that index provides the rolling history — identical
-    # to the merge_asof backward join + rolling computation used in training.
+    # We look up the last CVD candle whose timestamp <= ts_n1_live (N-1 bar),
+    # giving a slice where index -1 = N-1 bar. We then work on _delta_hist =
+    # _delta_arr[:-1] (dropping N-1) so all rolling windows end at N-2.
     #
-    # Parity guarantee: both paths use bars ending at N-1 (inclusive) and look
-    # back into history. Neither path reads the forming candle (N).
+    # Parity guarantee: training uses rolling(...).shift(1) which at the N-1
+    # merge point gives a window ending at N-2. Live mirrors this exactly by
+    # excluding the last bar from all rolling computations. Neither path reads
+    # the forming candle (N).
     # -----------------------------------------------------------------------
     cvd_live_available = (
         cvd_live is not None
@@ -991,23 +1014,32 @@ def build_live_features(
                 # --- rolling delta series (all bars up to N-1 inclusive) ---
                 _lts_arr = _cvd_slice["long_taker_size"].astype(float).values
                 _sts_arr = _cvd_slice["short_taker_size"].astype(float).values
-                _delta_arr = _lts_arr - _sts_arr  # shape (K,), K = bars up to N-1
+                _delta_arr = _lts_arr - _sts_arr  # shape (K,), last element = N-1 bar
 
-                # cvd_cumulative_5: sum of last 5 bars of delta (bars N-5..N-1)
-                # Equivalent to training: rolling(5).sum().shift(1) merged at N-1
-                # means the value AT N-1 position is sum of [N-5 .. N-1] bars.
-                if len(_delta_arr) >= 2:
-                    _slice5  = _delta_arr[max(0, len(_delta_arr) - 5):]
-                    _slice20 = _delta_arr[max(0, len(_delta_arr) - 20):]
+                # Training uses rolling(N).sum().shift(1) on the CVD frame, then
+                # merges at ts_n1 (N-1 bar). The shift(1) means the value stored at
+                # CVD bar index t is the rolling sum of bars [t-N .. t-1] — it does
+                # NOT include bar t itself. So when merged at N-1, the window ends at
+                # N-2 (one bar before N-1).
+                #
+                # Live fix: exclude the last element (_delta_arr[-1] = N-1) from all
+                # rolling computations by working on _delta_hist = _delta_arr[:-1].
+                # This gives a window ending at N-2, exactly matching training.
+                _delta_hist = _delta_arr[:-1]  # bars up to N-2 (training-equivalent)
+
+                # cvd_cumulative_5: sum of last 5 bars ending at N-2
+                if len(_delta_hist) >= 2:
+                    _slice5  = _delta_hist[max(0, len(_delta_hist) - 5):]
+                    _slice20 = _delta_hist[max(0, len(_delta_hist) - 20):]
                     cvd_cumulative_5_live  = float(np.sum(_slice5)  / max(atr5_val, 1e-9))
                     cvd_cumulative_20_live = float(np.sum(_slice20) / max(atr5_val, 1e-9))
                 else:
                     cvd_cumulative_5_live  = 0.0
                     cvd_cumulative_20_live = 0.0
 
-                # cvd_trend_slope: OLS slope over last 10 bars of delta
-                if len(_delta_arr) >= 3:
-                    _slope_vals = _delta_arr[max(0, len(_delta_arr) - 10):]
+                # cvd_trend_slope: OLS slope over last 10 bars ending at N-2
+                if len(_delta_hist) >= 3:
+                    _slope_vals = _delta_hist[max(0, len(_delta_hist) - 10):]
                     _v = _slope_vals[~np.isnan(_slope_vals)]
                     if len(_v) >= 3:
                         _x = np.arange(len(_v), dtype=np.float64)
@@ -1021,15 +1053,22 @@ def build_live_features(
                 else:
                     cvd_trend_slope_live = 0.0
 
-                # cvd_divergence: sign disagreement between price dir and CVD dir
-                # price direction: sign of sum(close-open) over last 5 5m candles ending at N-1
-                # df5[-1] is forming N, df5[-2] is N-1, so last 5 completed = df5[-6:-1]
-                if len(df5) >= 6:
-                    _price_bodies = (df5["close"].iloc[-6:-1] - df5["open"].iloc[-6:-1]).values
+                # cvd_divergence: sign disagreement between price dir and CVD dir.
+                # Both directions use the 5-bar window ending at N-2 to match
+                # training's shift(1) semantics.
+                #
+                # Price direction: training pre-shifts body5_sum before the asof
+                # merge, so the merged value at CVD bar t reflects the price-body
+                # sum ending one 5m candle BEFORE t. When t = N-1, that window ends
+                # at N-2. Live equivalent: df5[-7:-2] (5 closed candles ending at N-2;
+                # df5[-1] = forming N, df5[-2] = N-1, df5[-7:-2] = N-2..N-6).
+                if len(df5) >= 7:
+                    _price_bodies = (df5["close"].iloc[-7:-2] - df5["open"].iloc[-7:-2]).values
                     _price_dir = np.sign(float(np.sum(_price_bodies)))
                 else:
                     _price_dir = 0.0
-                _cvd_dir_5 = np.sign(float(np.sum(_delta_arr[max(0, len(_delta_arr) - 5):])))
+                # CVD direction: last 5 bars of _delta_hist (ending at N-2)
+                _cvd_dir_5 = np.sign(float(np.sum(_delta_hist[max(0, len(_delta_hist) - 5):])))
                 if _price_dir == 0.0 or _cvd_dir_5 == 0.0:
                     cvd_divergence_live = 0.0
                 elif _price_dir != _cvd_dir_5:
@@ -1037,13 +1076,15 @@ def build_live_features(
                 else:
                     cvd_divergence_live = -1.0  # aligning
 
-                # oi_change_5bar: (oi[N-1] - oi[N-6]) / |oi[N-6]|
-                if "open_interest" in _cvd_slice.columns and len(_cvd_slice) >= 6:
+                # oi_change_5bar: (oi[N-2] - oi[N-7]) / |oi[N-7]|
+                # Training: shift(1) → oi[N-2], shift(6) → oi[N-7] when merged at N-1.
+                # Live fix: use index -2 (N-2) and -7 (N-7) in the OI array.
+                if "open_interest" in _cvd_slice.columns and len(_cvd_slice) >= 7:
                     _oi_arr = _cvd_slice["open_interest"].astype(float).values
-                    _oi_n1  = _oi_arr[-1]
-                    _oi_n6  = _oi_arr[-6]
-                    _oi_denom = max(abs(_oi_n6), 1e-9)
-                    oi_change_5bar_live = float((_oi_n1 - _oi_n6) / _oi_denom)
+                    _oi_n2  = _oi_arr[-2]   # N-2 (matches training shift(1))
+                    _oi_n7  = _oi_arr[-7]   # N-7 (matches training shift(6))
+                    _oi_denom = max(abs(_oi_n7), 1e-9)
+                    oi_change_5bar_live = float((_oi_n2 - _oi_n7) / _oi_denom)
                 else:
                     oi_change_5bar_live = 0.0
 

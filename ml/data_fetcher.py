@@ -648,8 +648,8 @@ def fetch_live_gate_cvd(limit: int = 400) -> pd.DataFrame:
         limit: Number of 5m candles to fetch (default 400, max 2000).
 
     Returns:
-        DataFrame with columns: timestamp, long_taker_size, short_taker_size
-        Sorted ascending. Returns empty DataFrame on failure.
+        DataFrame with columns: timestamp, long_taker_size, short_taker_size, open_interest
+        Sorted ascending by timestamp. Returns empty DataFrame on failure.
     """
     _EMPTY = pd.DataFrame(columns=["timestamp", "long_taker_size", "short_taker_size", "open_interest"])
 
@@ -708,7 +708,7 @@ def fetch_all(months: int = 5) -> dict:
     """Fetch all 5 data sources for the last `months` months.
 
     Returns dict with keys: df5, df15, df1h, funding, cvd
-      cvd — Gate.io 5m taker buy/sell volume (long_taker_size, short_taker_size)
+      cvd — Gate.io 5m taker buy/sell volume (long_taker_size, short_taker_size, open_interest)
     """
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=months * 30)
